@@ -1,0 +1,21 @@
+# Binaries
+bin/
+
+# Drafts
+.drafts/
+
+# Claude config
+.claude/
+
+# Go build cache
+go.sum
+*.exe
+*.exe~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
