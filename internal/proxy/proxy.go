@@ -73,7 +73,7 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 			System:      system,
 			MaxTokens:   maxTokens,
 			Temperature: temperature,
-			Stream:      true,
+			Stream:      openAIReq.Stream,
 		},
 		ThreadID: uuid.New().String(),
 	}
