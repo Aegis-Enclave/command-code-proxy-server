@@ -9,7 +9,7 @@ import (
 	"github.com/dev2k6/command-code-proxy-server/internal/update"
 )
 
-const appVersion = "v1.0.2"
+const appVersion = "v1.0.3"
 const repositoryURL = "https://github.com/dev2k6/command-code-proxy-server"
 
 func main() {
