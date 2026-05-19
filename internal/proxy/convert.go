@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
@@ -29,10 +30,10 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 			contentParts := parseContent(m.Content)
 			for _, tc := range m.ToolCalls {
 				contentParts = append(contentParts, api.CCContentPart{
-					Type:       "tool_use",
-					ToolCallID: strPtr(tc.ID),
-					ToolName:   strPtr(tc.Function.Name),
-					Text:       strPtr(tc.Function.Arguments),
+					Type:  "tool_use",
+					ID:    strPtr(tc.ID),
+					Name:  strPtr(tc.Function.Name),
+					Input: parseToolInput(tc.Function.Arguments),
 				})
 			}
 			ccMsgs = append(ccMsgs, api.CCMessage{
@@ -97,6 +98,17 @@ func ConvertTools(openAITools []any) []any {
 	return tools
 }
 
+func parseToolInput(arguments string) any {
+	if arguments == "" {
+		return map[string]any{}
+	}
+	var input any
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+		return map[string]any{"arguments": arguments}
+	}
+	return input
+}
+
 func strPtr(s string) *string {
 	if s == "" {
 		return nil
@@ -120,6 +132,29 @@ func contentToString(content interface{}) string {
 	return ""
 }
 
+func contentPartToString(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				if text, ok := m["text"].(string); ok {
+					b.WriteString(text)
+				}
+			}
+		}
+		return b.String()
+	default:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	}
+}
+
 func parseContent(content interface{}) []api.CCContentPart {
 	switch v := content.(type) {
 	case string:
@@ -130,24 +165,42 @@ func parseContent(content interface{}) []api.CCContentPart {
 	case []any:
 		var parts []api.CCContentPart
 		for _, part := range v {
-			if partMap, ok := part.(map[string]any); ok {
-				if typ, ok := partMap["type"].(string); ok {
-					p := api.CCContentPart{Type: typ}
-					if text, ok := partMap["text"].(string); ok {
-						p.Text = strPtr(text)
-					}
-					if imgURL, ok := partMap["image_url"].(map[string]any); ok {
-						if url, ok := imgURL["url"].(string); ok {
-							merged := ""
-							if p.Text != nil {
-								merged = *p.Text
-							}
-							merged = merged + "\n[Image URL: " + url + "]"
-							p.Text = strPtr(merged)
-						}
-					}
-					parts = append(parts, p)
+			partMap, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := partMap["type"].(string)
+			switch typ {
+			case "text":
+				if text, ok := partMap["text"].(string); ok && text != "" {
+					parts = append(parts, api.CCContentPart{Type: "text", Text: strPtr(text)})
 				}
+			case "image_url":
+				if imgURL, ok := partMap["image_url"].(map[string]any); ok {
+					if url, ok := imgURL["url"].(string); ok && url != "" {
+						parts = append(parts, api.CCContentPart{Type: "text", Text: strPtr("[Image URL: " + url + "]")})
+					}
+				}
+			case "tool_use":
+				id, _ := partMap["id"].(string)
+				name, _ := partMap["name"].(string)
+				input := partMap["input"]
+				parts = append(parts, api.CCContentPart{Type: "tool_use", ID: strPtr(id), Name: strPtr(name), Input: input})
+			case "tool-call":
+				id, _ := partMap["id"].(string)
+				name, _ := partMap["name"].(string)
+				input := partMap["input"]
+				if input == nil {
+					input = partMap["arguments"]
+				}
+				parts = append(parts, api.CCContentPart{Type: "tool-call", ID: strPtr(id), Name: strPtr(name), Input: input})
+			case "tool_result", "tool-result":
+				toolID, _ := partMap["tool_use_id"].(string)
+				if toolID == "" {
+					toolID, _ = partMap["toolCallId"].(string)
+				}
+				toolName, _ := partMap["toolName"].(string)
+				parts = append(parts, api.CCContentPart{Type: "tool-result", ToolCallID: strPtr(toolID), ToolName: strPtr(toolName), Text: strPtr(contentPartToString(partMap["content"]))})
 			}
 		}
 		return parts

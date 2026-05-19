@@ -5,6 +5,9 @@ package api
 type CCContentPart struct {
 	Type       string  `json:"type"`
 	Text       *string `json:"text,omitempty"`
+	ID         *string `json:"id,omitempty"`
+	Name       *string `json:"name,omitempty"`
+	Input      any     `json:"input,omitempty"`
 	ToolCallID *string `json:"toolCallId,omitempty"`
 	ToolName   *string `json:"toolName,omitempty"`
 }
