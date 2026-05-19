@@ -219,6 +219,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	sentRole := false
 	toolCallIndex := 0
+	toolCallIndexes := map[string]int{}
 
 	for scanner.Scan() {
 		select {
@@ -238,77 +239,154 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			continue
 		}
 
-		switch event.Type {
-		case "text-delta":
-			delta := api.OpenAIDelta{Content: event.Text}
-			if !sentRole {
-				delta.Role = "assistant"
-				sentRole = true
+			switch event.Type {
+			case "text-delta":
+				delta := api.OpenAIDelta{Content: event.Text}
+				if !sentRole {
+					delta.Role = "assistant"
+					sentRole = true
+				}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+				})
+
+			case "tool-use":
+				toolCalls := []api.OpenAIDeltaToolCall{{
+					Index:    toolCallIndex,
+					ID:       event.ToolCallID,
+					Type:     "function",
+					Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
+				}}
+				delta := api.OpenAIDelta{ToolCalls: toolCalls}
+				if !sentRole {
+					delta.Role = "assistant"
+					sentRole = true
+				}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+				})
+				toolCallIndex++
+
+			case "tool-delta":
+				toolCalls := []api.OpenAIDeltaToolCall{{
+					Index:    toolCallIndex - 1,
+					Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
+				}}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
+				})
+
+			case "tool-input-start":
+				if _, ok := toolCallIndexes[event.ID]; !ok {
+					toolCallIndexes[event.ID] = toolCallIndex
+					toolCallIndex++
+				}
+				delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+					Index: toolCallIndexes[event.ID],
+					ID:    event.ID,
+					Type:  "function",
+					Function: &api.OpenAIDeltaFunction{
+						Name: event.ToolName,
+					},
+				}}}
+				if !sentRole {
+					delta.Role = "assistant"
+					sentRole = true
+				}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+				})
+
+			case "tool-input-delta":
+				idx, ok := toolCallIndexes[event.ID]
+				if !ok {
+					idx = toolCallIndex
+					toolCallIndexes[event.ID] = idx
+					toolCallIndex++
+				}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+						Index:    idx,
+						Function: &api.OpenAIDeltaFunction{Arguments: event.Delta},
+					}}}}},
+				})
+
+			case "tool-call":
+				idx, ok := toolCallIndexes[event.ToolCallID]
+				if !ok {
+					idx = toolCallIndex
+					toolCallIndexes[event.ToolCallID] = idx
+					toolCallIndex++
+				}
+				args := ""
+				if event.Input != nil {
+					if data, err := json.Marshal(event.Input); err == nil {
+						args = string(data)
+					}
+				}
+				delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+					Index: idx,
+					ID:    event.ToolCallID,
+					Type:  "function",
+					Function: &api.OpenAIDeltaFunction{
+						Name:      event.ToolName,
+						Arguments: args,
+					},
+				}}}
+				if !sentRole {
+					delta.Role = "assistant"
+					sentRole = true
+				}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+				})
+
+			case "finish":
+				reason := "stop"
+				if event.FinishReason == "tool_calls" || event.FinishReason == "tool-calls" {
+					reason = "tool_calls"
+				}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{
+						Index:        0,
+						Delta:        &api.OpenAIDelta{},
+						FinishReason: &reason,
+					}},
+				})
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+
+			case "error":
+				log.Printf("[ERROR] Stream error: %v", event.Error)
 			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-			})
-
-		case "tool-use":
-			toolCalls := []api.OpenAIDeltaToolCall{{
-				Index:    toolCallIndex,
-				ID:       event.ToolCallID,
-				Type:     "function",
-				Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
-			}}
-			delta := api.OpenAIDelta{ToolCalls: toolCalls}
-			if !sentRole {
-				delta.Role = "assistant"
-				sentRole = true
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-			})
-			toolCallIndex++
-
-		case "tool-delta":
-			toolCalls := []api.OpenAIDeltaToolCall{{
-				Index:    toolCallIndex - 1,
-				Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
-			}}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
-			})
-
-		case "finish":
-			reason := "stop"
-			if event.FinishReason == "tool_calls" {
-				reason = "tool_calls"
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{
-					Index:        0,
-					Delta:        &api.OpenAIDelta{},
-					FinishReason: &reason,
-				}},
-			})
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-
-		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
-		}
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF {
@@ -332,6 +410,8 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
+	toolCallByID := map[string]int{}
+	toolInputBuffers := map[string]*strings.Builder{}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -345,31 +425,75 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 			continue
 		}
 
-		switch event.Type {
-		case "text-delta":
-			content.WriteString(event.Text)
-		case "tool-use":
-			hasToolCalls = true
-			toolCalls = append(toolCalls, api.ToolCall{
-				ID:   event.ToolCallID,
-				Type: "function",
-				Function: api.FunctionCall{
-					Name:      event.ToolName,
-					Arguments: "",
-				},
-			})
-		case "tool-delta":
-			if len(toolCalls) > 0 {
-				toolCalls[len(toolCalls)-1].Function.Arguments += event.Text
+			switch event.Type {
+			case "text-delta":
+				content.WriteString(event.Text)
+			case "tool-use":
+				hasToolCalls = true
+				toolCallByID[event.ToolCallID] = len(toolCalls)
+				toolCalls = append(toolCalls, api.ToolCall{
+					ID:   event.ToolCallID,
+					Type: "function",
+					Function: api.FunctionCall{
+						Name:      event.ToolName,
+						Arguments: "",
+					},
+				})
+			case "tool-delta":
+				if len(toolCalls) > 0 {
+					toolCalls[len(toolCalls)-1].Function.Arguments += event.Text
+				}
+			case "tool-input-start":
+				hasToolCalls = true
+				toolCallByID[event.ID] = len(toolCalls)
+				toolInputBuffers[event.ID] = &strings.Builder{}
+				toolCalls = append(toolCalls, api.ToolCall{
+					ID:   event.ID,
+					Type: "function",
+					Function: api.FunctionCall{
+						Name:      event.ToolName,
+						Arguments: "",
+					},
+				})
+			case "tool-input-delta":
+				if b := toolInputBuffers[event.ID]; b != nil {
+					b.WriteString(event.Delta)
+				}
+				if idx, ok := toolCallByID[event.ID]; ok {
+					toolCalls[idx].Function.Arguments += event.Delta
+				}
+			case "tool-call":
+				hasToolCalls = true
+				args := ""
+				if event.Input != nil {
+					if data, err := json.Marshal(event.Input); err == nil {
+						args = string(data)
+					}
+				}
+				if idx, ok := toolCallByID[event.ToolCallID]; ok {
+					toolCalls[idx].Function.Name = event.ToolName
+					if args != "" {
+						toolCalls[idx].Function.Arguments = args
+					}
+				} else {
+					toolCallByID[event.ToolCallID] = len(toolCalls)
+					toolCalls = append(toolCalls, api.ToolCall{
+						ID:   event.ToolCallID,
+						Type: "function",
+						Function: api.FunctionCall{
+							Name:      event.ToolName,
+							Arguments: args,
+						},
+					})
+				}
+			case "finish":
+				if event.TotalUsage != nil {
+					inputTokens = event.TotalUsage.InputTokens
+					outputTokens = event.TotalUsage.OutputTokens
+				}
+			case "error":
+				log.Printf("[ERROR] Stream error: %v", event.Error)
 			}
-		case "finish":
-			if event.TotalUsage != nil {
-				inputTokens = event.TotalUsage.InputTokens
-				outputTokens = event.TotalUsage.OutputTokens
-			}
-		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
-		}
 	}
 
 	msg := &api.OpenAIMessage{
