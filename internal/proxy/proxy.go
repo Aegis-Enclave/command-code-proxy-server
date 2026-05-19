@@ -51,6 +51,11 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 		maxTokens = *openAIReq.MaxTokens
 	}
 
+	tools := openAIReq.Tools
+	if tools == nil {
+		tools = []any{}
+	}
+
 	ccBody := api.CCRequestBody{
 		Config: api.CCConfig{
 			WorkingDir:    ".",
@@ -69,7 +74,7 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 		Params: api.CCChatParams{
 			Model:       model,
 			Messages:    ccMessages,
-			Tools:       []any{},
+			Tools:       tools,
 			System:      system,
 			MaxTokens:   maxTokens,
 			Temperature: temperature,
@@ -204,6 +209,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	scanner := bufio.NewScanner(ccResp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	sentRole := false
+	toolCallIndex := 0
 
 	for scanner.Scan() {
 		select {
@@ -235,6 +241,40 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				Created: created,
 				Model:   model,
 				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
+		case "tool-use":
+			toolCalls := []api.OpenAIDeltaToolCall{{
+				Index:    toolCallIndex,
+				ID:       event.ToolCallID,
+				Type:     "function",
+				Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
+			}}
+			delta := api.OpenAIDelta{ToolCalls: toolCalls}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+			toolCallIndex++
+
+		case "tool-delta":
+			toolCalls := []api.OpenAIDeltaToolCall{{
+				Index:    toolCallIndex - 1,
+				Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
+			}}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
 			})
 
 		case "finish":
@@ -280,6 +320,8 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 
 	var content strings.Builder
 	var inputTokens, outputTokens int
+	var hasToolCalls bool
+	var toolCalls []api.ToolCall
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -295,6 +337,20 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		switch event.Type {
 		case "text-delta":
 			content.WriteString(event.Text)
+		case "tool-use":
+			hasToolCalls = true
+			toolCalls = append(toolCalls, api.ToolCall{
+				ID:   event.ToolCallID,
+				Type: "function",
+				Function: api.FunctionCall{
+					Name:      event.ToolName,
+					Arguments: "",
+				},
+			})
+		case "tool-delta":
+			if len(toolCalls) > 0 {
+				toolCalls[len(toolCalls)-1].Function.Arguments += event.Text
+			}
 		case "finish":
 			if event.TotalUsage != nil {
 				inputTokens = event.TotalUsage.InputTokens
@@ -305,18 +361,25 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		}
 	}
 
+	msg := &api.OpenAIMessage{
+		Role:    "assistant",
+		Content: content.String(),
+	}
+	finishReason := "stop"
+	if hasToolCalls {
+		msg.ToolCalls = toolCalls
+		finishReason = "tool_calls"
+	}
+
 	response := api.OpenAIChatResponse{
 		ID:      requestID,
 		Object:  "chat.completion",
 		Created: created,
 		Model:   model,
 		Choices: []api.OpenAIChoice{{
-			Index: 0,
-			Message: &api.OpenAIMessage{
-				Role:    "assistant",
-				Content: content.String(),
-			},
-			FinishReason: new(string),
+			Index:        0,
+			Message:      msg,
+			FinishReason: &finishReason,
 		}},
 		Usage: &api.OpenAIUsage{
 			PromptTokens:     inputTokens,
@@ -324,7 +387,6 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 			TotalTokens:      inputTokens + outputTokens,
 		},
 	}
-	*response.Choices[0].FinishReason = "stop"
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)

@@ -47,6 +47,7 @@ type OpenAIChatRequest struct {
 	Temperature *float64        `json:"temperature,omitempty"`
 	MaxTokens   *int            `json:"max_tokens,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
+	Tools       []any           `json:"tools,omitempty"`
 }
 
 type OpenAIChoice struct {
@@ -57,8 +58,21 @@ type OpenAIChoice struct {
 }
 
 type OpenAIDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string            `json:"role,omitempty"`
+	Content   string            `json:"content,omitempty"`
+	ToolCalls []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
+}
+
+type OpenAIDeltaToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function *OpenAIDeltaFunction `json:"function,omitempty"`
+}
+
+type OpenAIDeltaFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type OpenAIUsage struct {

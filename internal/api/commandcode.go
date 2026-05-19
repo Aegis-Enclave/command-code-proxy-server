@@ -48,6 +48,8 @@ type CCRequestBody struct {
 type CCStreamEvent struct {
 	Type         string `json:"type"`
 	Text         string `json:"text"`
+	ToolCallID   string `json:"toolCallId"`
+	ToolName     string `json:"toolName"`
 	FinishReason string `json:"finishReason"`
 	Error        *struct {
 		Message    string `json:"message"`
