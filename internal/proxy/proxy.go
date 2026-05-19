@@ -51,10 +51,7 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 		maxTokens = *openAIReq.MaxTokens
 	}
 
-	tools := openAIReq.Tools
-	if tools == nil {
-		tools = []any{}
-	}
+	tools := ConvertTools(openAIReq.Tools)
 
 	ccBody := api.CCRequestBody{
 		Config: api.CCConfig{

@@ -51,6 +51,52 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 	return ccMsgs
 }
 
+func ConvertTools(openAITools []any) []any {
+	if len(openAITools) == 0 {
+		return []any{}
+	}
+
+	tools := make([]any, 0, len(openAITools))
+	for _, tool := range openAITools {
+		toolMap, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		toolType, _ := toolMap["type"].(string)
+		if toolType != "function" {
+			tools = append(tools, toolMap)
+			continue
+		}
+
+		fn, ok := toolMap["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, _ := fn["name"].(string)
+		if name == "" {
+			continue
+		}
+
+		inputSchema, ok := fn["parameters"].(map[string]any)
+		if !ok || inputSchema == nil {
+			inputSchema = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+
+		ccTool := map[string]any{
+			"name":         name,
+			"input_schema": inputSchema,
+		}
+		if description, ok := fn["description"].(string); ok && description != "" {
+			ccTool["description"] = description
+		}
+		tools = append(tools, ccTool)
+	}
+
+	return tools
+}
+
 func strPtr(s string) *string {
 	if s == "" {
 		return nil
