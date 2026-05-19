@@ -22,7 +22,7 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 
 		if m.Role == "tool" {
 			ccMsgs = append(ccMsgs, api.CCMessage{
-				Role: "user",
+				Role: "tool",
 				Content: []api.CCContentPart{{
 					Type:      "tool_result",
 					ToolUseID: strPtr(m.ToolCallID),
