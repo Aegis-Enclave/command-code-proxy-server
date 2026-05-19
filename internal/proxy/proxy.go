@@ -19,6 +19,14 @@ import (
 
 const defaultBaseURL = "https://api.commandcode.ai"
 const defaultTimeout = 300 * time.Second
+const debugLogLimit = 20000
+
+func truncateLog(s string) string {
+	if len(s) <= debugLogLimit {
+		return s
+	}
+	return s[:debugLogLimit] + fmt.Sprintf("... [truncated %d bytes]", len(s)-debugLogLimit)
+}
 
 // Proxy struct
 type Proxy struct {
@@ -90,6 +98,8 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 
+	log.Printf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
+
 	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		p.BaseURL+"/alpha/generate", bytes.NewReader(reqJSON))
 	if err != nil {
@@ -139,6 +149,8 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"Failed to read body"}}`, http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[DEBUG] Client request body: %s", truncateLog(string(body)))
 
 	var openAIReq api.OpenAIChatRequest
 	if err := json.Unmarshal(body, &openAIReq); err != nil {
@@ -219,6 +231,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 		if line == "" {
 			continue
 		}
+		log.Printf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
 
 		var event api.CCStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
@@ -325,6 +338,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		if line == "" {
 			continue
 		}
+		log.Printf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
 
 		var event api.CCStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
