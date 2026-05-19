@@ -16,9 +16,9 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 				Role: "user",
 				Content: []api.CCContentPart{{
 					Type:       "tool-result",
-					ToolCallID: m.ToolCallID,
-					ToolName:   m.Name,
-					Text:       contentToString(m.Content),
+					ToolCallID: strPtr(m.ToolCallID),
+					ToolName:   strPtr(m.Name),
+					Text:       strPtr(contentToString(m.Content)),
 				}},
 			})
 			continue
@@ -30,9 +30,9 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 			for _, tc := range m.ToolCalls {
 				contentParts = append(contentParts, api.CCContentPart{
 					Type:       "tool_use",
-					ToolCallID: tc.ID,
-					ToolName:   tc.Function.Name,
-					Text:       tc.Function.Arguments,
+					ToolCallID: strPtr(tc.ID),
+					ToolName:   strPtr(tc.Function.Name),
+					Text:       strPtr(tc.Function.Arguments),
 				})
 			}
 			ccMsgs = append(ccMsgs, api.CCMessage{
@@ -49,6 +49,13 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 		})
 	}
 	return ccMsgs
+}
+
+func strPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 func contentToString(content interface{}) string {
@@ -73,7 +80,7 @@ func parseContent(content interface{}) []api.CCContentPart {
 		if v == "" {
 			return nil
 		}
-		return []api.CCContentPart{{Type: "text", Text: v}}
+		return []api.CCContentPart{{Type: "text", Text: strPtr(v)}}
 	case []any:
 		var parts []api.CCContentPart
 		for _, part := range v {
@@ -81,15 +88,16 @@ func parseContent(content interface{}) []api.CCContentPart {
 				if typ, ok := partMap["type"].(string); ok {
 					p := api.CCContentPart{Type: typ}
 					if text, ok := partMap["text"].(string); ok {
-						p.Text = text
+						p.Text = strPtr(text)
 					}
-					// Note: CommandCode API may not support image_url
-					// For now, we skip image parts
 					if imgURL, ok := partMap["image_url"].(map[string]any); ok {
 						if url, ok := imgURL["url"].(string); ok {
-							// Try to extract text from image (e.g., base64 data)
-							// or just include the URL as text
-							p.Text = p.Text + "\n[Image URL: " + url + "]"
+							merged := ""
+							if p.Text != nil {
+								merged = *p.Text
+							}
+							merged = merged + "\n[Image URL: " + url + "]"
+							p.Text = strPtr(merged)
 						}
 					}
 					parts = append(parts, p)
