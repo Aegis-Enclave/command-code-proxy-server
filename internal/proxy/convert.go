@@ -10,6 +10,38 @@ import (
 func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 	var ccMsgs []api.CCMessage
 	for _, m := range openAIMsgs {
+		// Convert tool role to user with tool-result type
+		if m.Role == "tool" {
+			ccMsgs = append(ccMsgs, api.CCMessage{
+				Role: "user",
+				Content: []api.CCContentPart{{
+					Type:       "tool-result",
+					ToolCallID: m.ToolCallID,
+					ToolName:   m.Name,
+					Text:       contentToString(m.Content),
+				}},
+			})
+			continue
+		}
+
+		// Convert assistant with tool_calls
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			contentParts := parseContent(m.Content)
+			for _, tc := range m.ToolCalls {
+				contentParts = append(contentParts, api.CCContentPart{
+					Type:       "tool_use",
+					ToolCallID: tc.ID,
+					ToolName:   tc.Function.Name,
+					Text:       tc.Function.Arguments,
+				})
+			}
+			ccMsgs = append(ccMsgs, api.CCMessage{
+				Role:    m.Role,
+				Content: contentParts,
+			})
+			continue
+		}
+
 		contentParts := parseContent(m.Content)
 		ccMsgs = append(ccMsgs, api.CCMessage{
 			Role:    m.Role,
@@ -17,6 +49,22 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 		})
 	}
 	return ccMsgs
+}
+
+func contentToString(content interface{}) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		for _, part := range v {
+			if partMap, ok := part.(map[string]any); ok {
+				if text, ok := partMap["text"].(string); ok {
+					return text
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func parseContent(content interface{}) []api.CCContentPart {

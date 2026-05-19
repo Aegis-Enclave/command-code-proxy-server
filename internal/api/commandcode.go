@@ -3,8 +3,10 @@ package api
 // CommandCode API types (internal)
 
 type CCContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type       string `json:"type"`
+	Text       string `json:"text,omitempty"`
+	ToolCallID string `json:"toolCallId,omitempty"`
+	ToolName   string `json:"toolName,omitempty"`
 }
 
 type CCMessage struct {
