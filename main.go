@@ -9,8 +9,9 @@ import (
 	"github.com/dev2k6/command-code-proxy-server/internal/update"
 )
 
-const appVersion = "v1.0.3"
+const appVersion = "v1.0.4"
 const repositoryURL = "https://github.com/dev2k6/command-code-proxy-server"
+const debugLogging = false
 
 func main() {
 	port := flag.String("port", "", "Port to run the server on (default: 55990)")
@@ -25,6 +26,7 @@ func main() {
 	}
 
 	proxy := proxy.NewProxy(*apiKey)
+	proxy.Debug = debugLogging
 
 	srv := server.NewServer(proxy)
 	srv.SetPort(*port)
@@ -57,6 +59,8 @@ func printStartupInfo(srv *server.Server) {
 	fmt.Println("")
 	fmt.Println("  Endpoints:")
 	fmt.Println("    POST /v1/chat/completions  (OpenAI-compatible)")
+	fmt.Println("    POST /chat/completions     (OpenAI-compatible alias)")
+	fmt.Println("    POST /v1/responses         (OpenAI Responses-compatible)")
 	fmt.Println("    GET  /v1/models            (list models)")
 	fmt.Println("    GET  /health               (health check)")
 	fmt.Println("")

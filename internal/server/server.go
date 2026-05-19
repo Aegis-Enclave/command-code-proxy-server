@@ -23,6 +23,8 @@ type Server struct {
 func NewServer(proxy *proxy.Proxy) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", logger(proxy.HandleChatCompletions))
+	mux.HandleFunc("/chat/completions", logger(proxy.HandleChatCompletions))
+	mux.HandleFunc("/v1/responses", logger(proxy.HandleResponses))
 	mux.HandleFunc("/v1/models", logger(proxy.HandleModels))
 	mux.HandleFunc("/health", logger(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

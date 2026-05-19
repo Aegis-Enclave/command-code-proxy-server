@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
@@ -10,24 +11,34 @@ import (
 // Convert OpenAI messages to CommandCode format
 func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 	var ccMsgs []api.CCMessage
+	toolNames := map[string]string{}
+
 	for _, m := range openAIMsgs {
-		// Convert tool role to user with tool-result type
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" && tc.Function.Name != "" {
+				toolNames[tc.ID] = tc.Function.Name
+			}
+		}
+
 		if m.Role == "tool" {
+			toolName := m.Name
+			if toolName == "" {
+				toolName = toolNames[m.ToolCallID]
+			}
 			ccMsgs = append(ccMsgs, api.CCMessage{
 				Role: "user",
 				Content: []api.CCContentPart{{
 					Type:       "tool-result",
 					ToolCallID: strPtr(m.ToolCallID),
-					ToolName:   strPtr(m.Name),
+					ToolName:   strPtr(toolName),
 					Text:       strPtr(contentToString(m.Content)),
 				}},
 			})
 			continue
 		}
 
-		// Convert assistant with tool_calls
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
-			contentParts := parseContent(m.Content)
+			contentParts := parseContent(m.Content, toolNames)
 			for _, tc := range m.ToolCalls {
 				contentParts = append(contentParts, api.CCContentPart{
 					Type:  "tool_use",
@@ -36,18 +47,11 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 					Input: parseToolInput(tc.Function.Arguments),
 				})
 			}
-			ccMsgs = append(ccMsgs, api.CCMessage{
-				Role:    m.Role,
-				Content: contentParts,
-			})
+			ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: contentParts})
 			continue
 		}
 
-		contentParts := parseContent(m.Content)
-		ccMsgs = append(ccMsgs, api.CCMessage{
-			Role:    m.Role,
-			Content: contentParts,
-		})
+		ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: parseContent(m.Content, toolNames)})
 	}
 	return ccMsgs
 }
@@ -85,10 +89,7 @@ func ConvertTools(openAITools []any) []any {
 			inputSchema = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
 
-		ccTool := map[string]any{
-			"name":         name,
-			"input_schema": inputSchema,
-		}
+		ccTool := map[string]any{"name": name, "input_schema": inputSchema}
 		if description, ok := fn["description"].(string); ok && description != "" {
 			ccTool["description"] = description
 		}
@@ -118,29 +119,16 @@ func strPtr(s string) *string {
 
 func contentToString(content interface{}) string {
 	switch v := content.(type) {
-	case string:
-		return v
-	case []any:
-		for _, part := range v {
-			if partMap, ok := part.(map[string]any); ok {
-				if text, ok := partMap["text"].(string); ok {
-					return text
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func contentPartToString(content any) string {
-	switch v := content.(type) {
+	case nil:
+		return ""
 	case string:
 		return v
 	case []any:
 		var b strings.Builder
-		for _, item := range v {
-			if m, ok := item.(map[string]any); ok {
-				if text, ok := m["text"].(string); ok {
+		for _, part := range v {
+			if partMap, ok := part.(map[string]any); ok {
+				text := contentPartToString(partMap)
+				if text != "" {
 					b.WriteString(text)
 				}
 			}
@@ -155,8 +143,48 @@ func contentPartToString(content any) string {
 	}
 }
 
-func parseContent(content interface{}) []api.CCContentPart {
+func contentPartToString(content any) string {
 	switch v := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				b.WriteString(contentPartToString(m))
+			}
+		}
+		return b.String()
+	case map[string]any:
+		for _, key := range []string{"text", "content", "output_text", "input_text", "refusal", "thinking", "redacted_thinking"} {
+			if text, ok := v[key].(string); ok {
+				return text
+			}
+		}
+		if imgURL, ok := v["image_url"].(map[string]any); ok {
+			if url, ok := imgURL["url"].(string); ok {
+				return "[Image URL: " + url + "]"
+			}
+		}
+		if url, ok := v["image_url"].(string); ok {
+			return "[Image URL: " + url + "]"
+		}
+		data, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func parseContent(content interface{}, toolNames map[string]string) []api.CCContentPart {
+	switch v := content.(type) {
+	case nil:
+		return nil
 	case string:
 		if v == "" {
 			return nil
@@ -171,24 +199,27 @@ func parseContent(content interface{}) []api.CCContentPart {
 			}
 			typ, _ := partMap["type"].(string)
 			switch typ {
-			case "text":
-				if text, ok := partMap["text"].(string); ok && text != "" {
+			case "text", "input_text", "output_text", "refusal", "thinking", "redacted_thinking", "reasoning", "document", "search_result":
+				if text := contentPartToString(partMap); text != "" {
 					parts = append(parts, api.CCContentPart{Type: "text", Text: strPtr(text)})
 				}
-			case "image_url":
-				if imgURL, ok := partMap["image_url"].(map[string]any); ok {
-					if url, ok := imgURL["url"].(string); ok && url != "" {
-						parts = append(parts, api.CCContentPart{Type: "text", Text: strPtr("[Image URL: " + url + "]")})
-					}
+			case "image_url", "input_image", "image":
+				if text := contentPartToString(partMap); text != "" {
+					parts = append(parts, api.CCContentPart{Type: "text", Text: strPtr(text)})
 				}
 			case "tool_use":
 				id, _ := partMap["id"].(string)
 				name, _ := partMap["name"].(string)
-				input := partMap["input"]
-				parts = append(parts, api.CCContentPart{Type: "tool_use", ID: strPtr(id), Name: strPtr(name), Input: input})
+				if id != "" && name != "" {
+					toolNames[id] = name
+				}
+				parts = append(parts, api.CCContentPart{Type: "tool_use", ID: strPtr(id), Name: strPtr(name), Input: partMap["input"]})
 			case "tool-call":
 				id, _ := partMap["id"].(string)
 				name, _ := partMap["name"].(string)
+				if id != "" && name != "" {
+					toolNames[id] = name
+				}
 				input := partMap["input"]
 				if input == nil {
 					input = partMap["arguments"]
@@ -200,12 +231,15 @@ func parseContent(content interface{}) []api.CCContentPart {
 					toolID, _ = partMap["toolCallId"].(string)
 				}
 				toolName, _ := partMap["toolName"].(string)
+				if toolName == "" {
+					toolName = toolNames[toolID]
+				}
 				parts = append(parts, api.CCContentPart{Type: "tool-result", ToolCallID: strPtr(toolID), ToolName: strPtr(toolName), Text: strPtr(contentPartToString(partMap["content"]))})
 			}
 		}
 		return parts
 	default:
-		return nil
+		return []api.CCContentPart{{Type: "text", Text: strPtr(contentToString(v))}}
 	}
 }
 
@@ -218,9 +252,7 @@ func ExtractSystem(msgs []api.OpenAIMessage) (string, []api.OpenAIMessage) {
 			if system.Len() > 0 {
 				system.WriteString("\n")
 			}
-			if contentStr, ok := m.Content.(string); ok {
-				system.WriteString(contentStr)
-			}
+			system.WriteString(contentToString(m.Content))
 		} else {
 			rest = append(rest, m)
 		}

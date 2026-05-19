@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
 	"github.com/dev2k6/command-code-proxy-server/internal/version"
+	"github.com/google/uuid"
 )
 
 const defaultBaseURL = "https://api.commandcode.ai"
@@ -28,11 +28,42 @@ func truncateLog(s string) string {
 	return s[:debugLogLimit] + fmt.Sprintf("... [truncated %d bytes]", len(s)-debugLogLimit)
 }
 
+func (p *Proxy) debugf(format string, args ...any) {
+	if p.Debug {
+		log.Printf(format, args...)
+	}
+}
+
+func (p *Proxy) writeOpenAIError(w http.ResponseWriter, status int, message, errType string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(api.OpenAIErrorResponse{Error: api.OpenAIError{
+		Message: message,
+		Type:    errType,
+		Param:   nil,
+		Code:    nil,
+	}})
+}
+
+func normalizeFinishReason(reason string) string {
+	switch reason {
+	case "tool_calls", "tool-calls":
+		return "tool_calls"
+	case "length", "max_tokens":
+		return "length"
+	case "content_filter", "content-filter":
+		return "content_filter"
+	default:
+		return "stop"
+	}
+}
+
 // Proxy struct
 type Proxy struct {
 	APIKey  string
 	BaseURL string
 	Client  *http.Client
+	Debug   bool
 }
 
 // NewProxy creates a new proxy instance
@@ -58,6 +89,9 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 	if openAIReq.MaxTokens != nil {
 		maxTokens = *openAIReq.MaxTokens
 	}
+	if openAIReq.MaxCompletionTokens != nil {
+		maxTokens = *openAIReq.MaxCompletionTokens
+	}
 
 	tools := ConvertTools(openAIReq.Tools)
 
@@ -73,9 +107,9 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 			GitStatus:     "",
 			RecentCommits: []string{},
 		},
-		Memory:   "",
-		Taste:    "",
-		Skills:   "",
+		Memory: "",
+		Taste:  "",
+		Skills: "",
 		Params: api.CCChatParams{
 			Model:       model,
 			Messages:    ccMessages,
@@ -98,7 +132,7 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 
-	log.Printf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
+	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
 
 	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		p.BaseURL+"/alpha/generate", bytes.NewReader(reqJSON))
@@ -127,7 +161,7 @@ func (p *Proxy) CallUpstream(req *http.Request) (*http.Response, error) {
 // HandleChatCompletions handles the /v1/chat/completions endpoint
 func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":{"message":"Method not allowed"}}`, http.StatusMethodNotAllowed)
+		p.writeOpenAIError(w, http.StatusMethodNotAllowed, "Method not allowed", "invalid_request_error")
 		return
 	}
 
@@ -139,56 +173,61 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else if p.APIKey != "" {
 		apiKey = p.APIKey
 	} else {
-		http.Error(w, `{"error":{"message":"API key required. Set Authorization header."}}`, http.StatusUnauthorized)
+		p.writeOpenAIError(w, http.StatusUnauthorized, "API key required. Set Authorization header.", "authentication_error")
 		return
 	}
 
 	// Read request
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, `{"error":{"message":"Failed to read body"}}`, http.StatusBadRequest)
+		p.writeOpenAIError(w, http.StatusBadRequest, "Failed to read body", "invalid_request_error")
 		return
 	}
 
-	log.Printf("[DEBUG] Client request body: %s", truncateLog(string(body)))
+	p.debugf("[DEBUG] Client request body: %s", truncateLog(string(body)))
 
 	var openAIReq api.OpenAIChatRequest
 	if err := json.Unmarshal(body, &openAIReq); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"Invalid JSON: %s"}}`, err.Error()), http.StatusBadRequest)
+		p.writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %s", err.Error()), "invalid_request_error")
 		return
 	}
 
 	if len(openAIReq.Messages) == 0 {
-		http.Error(w, `{"error":{"message":"messages array is required"}}`, http.StatusBadRequest)
+		p.writeOpenAIError(w, http.StatusBadRequest, "messages array is required", "invalid_request_error")
 		return
 	}
 
 	// Build CommandCode request
 	ccBody, err := p.BuildRequest(openAIReq)
 	if err != nil {
-		http.Error(w, `{"error":{"message":"Failed to build request"}}`, http.StatusInternalServerError)
+		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
 		return
 	}
 
 	// Create upstream request
 	ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
 	if err != nil {
-		http.Error(w, `{"error":{"message":"Failed to create upstream request"}}`, http.StatusInternalServerError)
+		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
 		return
 	}
 
 	// Call upstream
 	ccResp, err := p.CallUpstream(ccReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s"}}`, err.Error()), http.StatusBadGateway)
+		p.writeOpenAIError(w, http.StatusBadGateway, err.Error(), "api_error")
 		return
 	}
 	defer ccResp.Body.Close()
 
 	if ccResp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(ccResp.Body)
+		message := fmt.Sprintf("Upstream error: %s", string(errBody))
 		log.Printf("[ERROR] Upstream returned %d: %s", ccResp.StatusCode, string(errBody))
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"Upstream error: %s"}}`, string(errBody)), http.StatusBadGateway)
+		status := http.StatusBadGateway
+		if ccResp.StatusCode >= http.StatusBadRequest && ccResp.StatusCode < http.StatusInternalServerError {
+			status = ccResp.StatusCode
+		}
+		p.writeOpenAIError(w, status, message, "api_error")
 		return
 	}
 
@@ -206,7 +245,7 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, `{"error":{"message":"Streaming not supported"}}`, http.StatusInternalServerError)
+		p.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
 		return
 	}
 
@@ -232,161 +271,158 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 		if line == "" {
 			continue
 		}
-		log.Printf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
+		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
 
 		var event api.CCStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			continue
 		}
 
-			switch event.Type {
-			case "text-delta":
-				delta := api.OpenAIDelta{Content: event.Text}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-
-			case "tool-use":
-				toolCalls := []api.OpenAIDeltaToolCall{{
-					Index:    toolCallIndex,
-					ID:       event.ToolCallID,
-					Type:     "function",
-					Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
-				}}
-				delta := api.OpenAIDelta{ToolCalls: toolCalls}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-				toolCallIndex++
-
-			case "tool-delta":
-				toolCalls := []api.OpenAIDeltaToolCall{{
-					Index:    toolCallIndex - 1,
-					Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
-				}}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
-				})
-
-			case "tool-input-start":
-				if _, ok := toolCallIndexes[event.ID]; !ok {
-					toolCallIndexes[event.ID] = toolCallIndex
-					toolCallIndex++
-				}
-				delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-					Index: toolCallIndexes[event.ID],
-					ID:    event.ID,
-					Type:  "function",
-					Function: &api.OpenAIDeltaFunction{
-						Name: event.ToolName,
-					},
-				}}}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-
-			case "tool-input-delta":
-				idx, ok := toolCallIndexes[event.ID]
-				if !ok {
-					idx = toolCallIndex
-					toolCallIndexes[event.ID] = idx
-					toolCallIndex++
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-						Index:    idx,
-						Function: &api.OpenAIDeltaFunction{Arguments: event.Delta},
-					}}}}},
-				})
-
-			case "tool-call":
-				idx, ok := toolCallIndexes[event.ToolCallID]
-				if !ok {
-					idx = toolCallIndex
-					toolCallIndexes[event.ToolCallID] = idx
-					toolCallIndex++
-				}
-				args := ""
-				if event.Input != nil {
-					if data, err := json.Marshal(event.Input); err == nil {
-						args = string(data)
-					}
-				}
-				delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-					Index: idx,
-					ID:    event.ToolCallID,
-					Type:  "function",
-					Function: &api.OpenAIDeltaFunction{
-						Name:      event.ToolName,
-						Arguments: args,
-					},
-				}}}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-
-			case "finish":
-				reason := "stop"
-				if event.FinishReason == "tool_calls" || event.FinishReason == "tool-calls" {
-					reason = "tool_calls"
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{
-						Index:        0,
-						Delta:        &api.OpenAIDelta{},
-						FinishReason: &reason,
-					}},
-				})
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-
-			case "error":
-				log.Printf("[ERROR] Stream error: %v", event.Error)
+		switch event.Type {
+		case "text-delta":
+			delta := api.OpenAIDelta{Content: event.Text}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
 			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
+		case "tool-use":
+			toolCalls := []api.OpenAIDeltaToolCall{{
+				Index:    toolCallIndex,
+				ID:       event.ToolCallID,
+				Type:     "function",
+				Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
+			}}
+			delta := api.OpenAIDelta{ToolCalls: toolCalls}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+			toolCallIndex++
+
+		case "tool-delta":
+			toolCalls := []api.OpenAIDeltaToolCall{{
+				Index:    toolCallIndex - 1,
+				Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
+			}}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
+			})
+
+		case "tool-input-start":
+			if _, ok := toolCallIndexes[event.ID]; !ok {
+				toolCallIndexes[event.ID] = toolCallIndex
+				toolCallIndex++
+			}
+			delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+				Index: toolCallIndexes[event.ID],
+				ID:    event.ID,
+				Type:  "function",
+				Function: &api.OpenAIDeltaFunction{
+					Name: event.ToolName,
+				},
+			}}}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
+		case "tool-input-delta":
+			idx, ok := toolCallIndexes[event.ID]
+			if !ok {
+				idx = toolCallIndex
+				toolCallIndexes[event.ID] = idx
+				toolCallIndex++
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+					Index:    idx,
+					Function: &api.OpenAIDeltaFunction{Arguments: event.Delta},
+				}}}}},
+			})
+
+		case "tool-call":
+			if _, alreadyStreamed := toolCallIndexes[event.ToolCallID]; alreadyStreamed {
+				continue
+			}
+			idx := toolCallIndex
+			toolCallIndexes[event.ToolCallID] = idx
+			toolCallIndex++
+			args := ""
+			if event.Input != nil {
+				if data, err := json.Marshal(event.Input); err == nil {
+					args = string(data)
+				}
+			}
+			delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+				Index: idx,
+				ID:    event.ToolCallID,
+				Type:  "function",
+				Function: &api.OpenAIDeltaFunction{
+					Name:      event.ToolName,
+					Arguments: args,
+				},
+			}}}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
+		case "finish":
+			reason := normalizeFinishReason(event.FinishReason)
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{
+					Index:        0,
+					Delta:        &api.OpenAIDelta{},
+					FinishReason: &reason,
+				}},
+			})
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+
+		case "error":
+			log.Printf("[ERROR] Stream error: %v", event.Error)
+		}
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF {
@@ -418,82 +454,82 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		if line == "" {
 			continue
 		}
-		log.Printf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
+		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
 
 		var event api.CCStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			continue
 		}
 
-			switch event.Type {
-			case "text-delta":
-				content.WriteString(event.Text)
-			case "tool-use":
-				hasToolCalls = true
+		switch event.Type {
+		case "text-delta":
+			content.WriteString(event.Text)
+		case "tool-use":
+			hasToolCalls = true
+			toolCallByID[event.ToolCallID] = len(toolCalls)
+			toolCalls = append(toolCalls, api.ToolCall{
+				ID:   event.ToolCallID,
+				Type: "function",
+				Function: api.FunctionCall{
+					Name:      event.ToolName,
+					Arguments: "",
+				},
+			})
+		case "tool-delta":
+			if len(toolCalls) > 0 {
+				toolCalls[len(toolCalls)-1].Function.Arguments += event.Text
+			}
+		case "tool-input-start":
+			hasToolCalls = true
+			toolCallByID[event.ID] = len(toolCalls)
+			toolInputBuffers[event.ID] = &strings.Builder{}
+			toolCalls = append(toolCalls, api.ToolCall{
+				ID:   event.ID,
+				Type: "function",
+				Function: api.FunctionCall{
+					Name:      event.ToolName,
+					Arguments: "",
+				},
+			})
+		case "tool-input-delta":
+			if b := toolInputBuffers[event.ID]; b != nil {
+				b.WriteString(event.Delta)
+			}
+			if idx, ok := toolCallByID[event.ID]; ok {
+				toolCalls[idx].Function.Arguments += event.Delta
+			}
+		case "tool-call":
+			hasToolCalls = true
+			args := ""
+			if event.Input != nil {
+				if data, err := json.Marshal(event.Input); err == nil {
+					args = string(data)
+				}
+			}
+			if idx, ok := toolCallByID[event.ToolCallID]; ok {
+				toolCalls[idx].Function.Name = event.ToolName
+				if args != "" {
+					toolCalls[idx].Function.Arguments = args
+				}
+			} else {
 				toolCallByID[event.ToolCallID] = len(toolCalls)
 				toolCalls = append(toolCalls, api.ToolCall{
 					ID:   event.ToolCallID,
 					Type: "function",
 					Function: api.FunctionCall{
 						Name:      event.ToolName,
-						Arguments: "",
+						Arguments: args,
 					},
 				})
-			case "tool-delta":
-				if len(toolCalls) > 0 {
-					toolCalls[len(toolCalls)-1].Function.Arguments += event.Text
-				}
-			case "tool-input-start":
-				hasToolCalls = true
-				toolCallByID[event.ID] = len(toolCalls)
-				toolInputBuffers[event.ID] = &strings.Builder{}
-				toolCalls = append(toolCalls, api.ToolCall{
-					ID:   event.ID,
-					Type: "function",
-					Function: api.FunctionCall{
-						Name:      event.ToolName,
-						Arguments: "",
-					},
-				})
-			case "tool-input-delta":
-				if b := toolInputBuffers[event.ID]; b != nil {
-					b.WriteString(event.Delta)
-				}
-				if idx, ok := toolCallByID[event.ID]; ok {
-					toolCalls[idx].Function.Arguments += event.Delta
-				}
-			case "tool-call":
-				hasToolCalls = true
-				args := ""
-				if event.Input != nil {
-					if data, err := json.Marshal(event.Input); err == nil {
-						args = string(data)
-					}
-				}
-				if idx, ok := toolCallByID[event.ToolCallID]; ok {
-					toolCalls[idx].Function.Name = event.ToolName
-					if args != "" {
-						toolCalls[idx].Function.Arguments = args
-					}
-				} else {
-					toolCallByID[event.ToolCallID] = len(toolCalls)
-					toolCalls = append(toolCalls, api.ToolCall{
-						ID:   event.ToolCallID,
-						Type: "function",
-						Function: api.FunctionCall{
-							Name:      event.ToolName,
-							Arguments: args,
-						},
-					})
-				}
-			case "finish":
-				if event.TotalUsage != nil {
-					inputTokens = event.TotalUsage.InputTokens
-					outputTokens = event.TotalUsage.OutputTokens
-				}
-			case "error":
-				log.Printf("[ERROR] Stream error: %v", event.Error)
 			}
+		case "finish":
+			if event.TotalUsage != nil {
+				inputTokens = event.TotalUsage.InputTokens
+				outputTokens = event.TotalUsage.OutputTokens
+			}
+		case "error":
+			log.Printf("[ERROR] Stream error: %v", event.Error)
+		}
 	}
 
 	msg := &api.OpenAIMessage{
@@ -502,6 +538,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	}
 	finishReason := "stop"
 	if hasToolCalls {
+		msg.Content = nil
 		msg.ToolCalls = toolCalls
 		finishReason = "tool_calls"
 	}
@@ -525,6 +562,108 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func (p *Proxy) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		p.writeOpenAIError(w, http.StatusMethodNotAllowed, "Method not allowed", "invalid_request_error")
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		p.writeOpenAIError(w, http.StatusBadRequest, "Failed to read body", "invalid_request_error")
+		return
+	}
+
+	p.debugf("[DEBUG] Client responses request body: %s", truncateLog(string(body)))
+
+	var responsesReq api.OpenAIResponsesRequest
+	if err := json.Unmarshal(body, &responsesReq); err != nil {
+		p.writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %s", err.Error()), "invalid_request_error")
+		return
+	}
+
+	chatReq := responsesToChatRequest(responsesReq)
+	rewritten, err := json.Marshal(chatReq)
+	if err != nil {
+		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
+		return
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(rewritten))
+	r.ContentLength = int64(len(rewritten))
+	p.HandleChatCompletions(w, r)
+}
+
+func responsesToChatRequest(req api.OpenAIResponsesRequest) api.OpenAIChatRequest {
+	messages := responsesInputToMessages(req.Input)
+	if req.Instructions != nil {
+		messages = append([]api.OpenAIMessage{{Role: "system", Content: req.Instructions}}, messages...)
+	}
+
+	maxTokens := req.MaxCompletionTokens
+	if maxTokens == nil {
+		maxTokens = req.MaxOutputTokens
+	}
+	if maxTokens == nil {
+		maxTokens = req.MaxTokens
+	}
+
+	return api.OpenAIChatRequest{
+		Model:               req.Model,
+		Messages:            messages,
+		Temperature:         req.Temperature,
+		MaxTokens:           req.MaxTokens,
+		MaxCompletionTokens: maxTokens,
+		Stream:              req.Stream,
+		Tools:               req.Tools,
+		ToolChoice:          req.ToolChoice,
+		ParallelToolCalls:   req.ParallelToolCalls,
+		ResponseFormat:      req.ResponseFormat,
+		Stop:                req.Stop,
+		TopP:                req.TopP,
+		User:                req.User,
+	}
+}
+
+func responsesInputToMessages(input any) []api.OpenAIMessage {
+	switch v := input.(type) {
+	case nil:
+		return nil
+	case string:
+		return []api.OpenAIMessage{{Role: "user", Content: v}}
+	case []any:
+		if messages := responseItemsToMessages(v); len(messages) > 0 {
+			return messages
+		}
+		return []api.OpenAIMessage{{Role: "user", Content: v}}
+	default:
+		return []api.OpenAIMessage{{Role: "user", Content: v}}
+	}
+}
+
+func responseItemsToMessages(items []any) []api.OpenAIMessage {
+	messages := make([]api.OpenAIMessage, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		if role == "" {
+			role = "user"
+		}
+		content := m["content"]
+		if content == nil {
+			content = m["text"]
+		}
+		if content == nil {
+			content = m["input"]
+		}
+		messages = append(messages, api.OpenAIMessage{Role: role, Content: content})
+	}
+	return messages
 }
 
 // HandleModels handles the /v1/models endpoint
