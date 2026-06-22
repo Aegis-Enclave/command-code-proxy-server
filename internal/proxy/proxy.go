@@ -122,6 +122,21 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 		ThreadID: uuid.New().String(),
 	}
 
+	// Forward reasoning/thinking params from OpenAI request to CommandCode API.
+	// The upstream may or may not support these; passing them through unblocks
+	// thinking mode for models (DeepSeek, etc.) that support it.
+	if openAIReq.ReasoningEffort != nil {
+		ccBody.Params.ThinkingEffort = openAIReq.ReasoningEffort
+	}
+	if openAIReq.Thinking != nil {
+		if thinkingMap := *openAIReq.Thinking; thinkingMap != nil {
+			if t, ok := thinkingMap["type"].(string); ok && t == "enabled" {
+				enabled := true
+				ccBody.Params.EnableThinking = &enabled
+			}
+		}
+	}
+
 	return ccBody, nil
 }
 
@@ -293,6 +308,26 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
 			})
 
+		case "reasoning-delta", "thinking-delta":
+			rc := event.Text
+			if rc == "" {
+				rc = event.Delta
+			}
+			if rc != "" {
+				delta := api.OpenAIDelta{ReasoningContent: &rc}
+				if !sentRole {
+					delta.Role = "assistant"
+					sentRole = true
+				}
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+				})
+			}
+
 		case "tool-use":
 			toolCalls := []api.OpenAIDeltaToolCall{{
 				Index:    toolCallIndex,
@@ -443,6 +478,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var content strings.Builder
+	var reasoningContent strings.Builder
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
@@ -464,6 +500,12 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		switch event.Type {
 		case "text-delta":
 			content.WriteString(event.Text)
+		case "reasoning-delta", "thinking-delta":
+			rc := event.Text
+			if rc == "" {
+				rc = event.Delta
+			}
+			reasoningContent.WriteString(rc)
 		case "tool-use":
 			hasToolCalls = true
 			toolCallByID[event.ToolCallID] = len(toolCalls)
@@ -535,6 +577,10 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	msg := &api.OpenAIMessage{
 		Role:    "assistant",
 		Content: content.String(),
+	}
+	if reasoningContent.Len() > 0 {
+		rc := reasoningContent.String()
+		msg.ReasoningContent = &rc
 	}
 	finishReason := "stop"
 	if hasToolCalls {

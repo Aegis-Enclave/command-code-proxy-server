@@ -3,13 +3,14 @@ package api
 // OpenAI-compatible types (client-facing)
 
 type OpenAIMessage struct {
-	Role       string        `json:"role"`
-	Content    interface{}   `json:"content,omitempty"`
-	Name       string        `json:"name,omitempty"`
-	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	Refusal    string        `json:"refusal,omitempty"`
-	Audio      *MessageAudio `json:"audio,omitempty"`
+	Role             string        `json:"role"`
+	Content          interface{}   `json:"content,omitempty"`
+	Name             string        `json:"name,omitempty"`
+	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	Refusal          string        `json:"refusal,omitempty"`
+	ReasoningContent *string       `json:"reasoning_content,omitempty"`
+	Audio            *MessageAudio `json:"audio,omitempty"`
 }
 
 type ContentPart struct {
@@ -58,6 +59,8 @@ type OpenAIChatRequest struct {
 	PresencePenalty     *float64        `json:"presence_penalty,omitempty"`
 	FrequencyPenalty    *float64        `json:"frequency_penalty,omitempty"`
 	User                string          `json:"user,omitempty"`
+	ReasoningEffort     *string         `json:"reasoning_effort,omitempty"`
+	Thinking            *map[string]any `json:"thinking,omitempty"`
 }
 
 type OpenAIResponsesRequest struct {
@@ -86,10 +89,11 @@ type OpenAIChoice struct {
 }
 
 type OpenAIDelta struct {
-	Role      string                `json:"role,omitempty"`
-	Content   string                `json:"content,omitempty"`
-	ToolCalls []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
-	Refusal   string                `json:"refusal,omitempty"`
+	Role             string                `json:"role,omitempty"`
+	Content          string                `json:"content,omitempty"`
+	ToolCalls        []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
+	Refusal          string                `json:"refusal,omitempty"`
+	ReasoningContent *string               `json:"reasoning_content,omitempty"`
 }
 
 type OpenAIDeltaToolCall struct {
